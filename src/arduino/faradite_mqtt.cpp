@@ -130,6 +130,10 @@ void setup() {
   mqttClient.setCallback(subscribeReceive);
   
   Ethernet.begin(mac, ip);
+
+  char ipMsgBuff[40];
+  sprintf(ipMsgBuff, "Starting ethernet with IP %d.%d.%d.%d", IP1, IP2, IP3, IP4);
+  Serial.println(ipMsgBuff);
   
   // Wait for ethernet to be ready
   delay(2000);
@@ -242,13 +246,13 @@ void mqttReconnect() {
   if(currentMillis - mqttReconnectMillis >= mqttReconnectFrequency) {
     mqttReconnectMillis = currentMillis;
     
-    Serial.print("Attempting MQTT connection...");
+    Serial.print("Attempting MQTT connection to "); Serial.print(mqttServer); Serial.print("...");
     // Attempt to connect
     if (mqttClient.connect("arduinoClient")) {
       Serial.println("connected");
     } else {
       Serial.print("failed, rc=");
-      Serial.print(mqttClient.state());
+      Serial.println(mqttClient.state());
     }
   }
 }
