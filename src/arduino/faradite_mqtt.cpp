@@ -1,21 +1,5 @@
-#include <Ewma.h>
-#include <EwmaT.h>
-
-#include <Ethernet.h>
-#include <SPI.h>
-
-#include <PubSubClient.h>
-
-void readLux();
-void readMotion();
-void mqttReconnect();
-void subscribeReceive(char* topic, byte* payload, unsigned int length);
-bool publishToTopic(char* topic, char* payload);
-char* ADCIntToChar(int intValue);
-float clamp(float d, float min, float max);
-
 /*
-  Read Faradite Motion 360 sensor values and send to MQTT topic.
+  Read Faradite Motion 360 sensor values using an Arduino with Ethernet Shield and send to MQTT topic.
   
   The main goal of this code is to publish cleansed motion and lux sensor values to MQTT topics at a timely cadence.
   It is also reactive, in that significant sudden changes should break the typical cadence cycle and be sent immediately.
@@ -24,6 +8,13 @@ float clamp(float d, float min, float max);
   
   Currently only supports one unit.
 */
+
+#include <Ewma.h>
+#include <EwmaT.h>
+#include <Ethernet.h>
+#include <SPI.h>
+#include <PubSubClient.h>
+
 
 /*
   Build Configuration 
@@ -52,60 +43,82 @@ float clamp(float d, float min, float max);
 */
 
 
-// Parameters
+/*
+  Parameters
 
-  // Sensor
-  unsigned int mainLoopFrequency = 1;                     // How long to wait between main loop iterations in ms. This directly affects how often the pins are read
-  unsigned int luxPublishFrequency = 60000;               // How often to publish lux in ms
-  float        luxReactiveThreshold = 1.6;                // Factor that the lux value that needs to change for a reactive publish of lux values
-  float        filterAlpha = mainLoopFrequency * 0.005;   // Smoothing factor for lux values. Lower is more smoothing but less responsive. Range of 0 - 1.0. Paired with 
-                                                          // mainLoopFrequency so that can be changed without affecting the desired filter behaviour
-  // Debugging
-  bool         debug = false;                             // Send various debug output via MQTT
-  unsigned int debugPublishFrequency = 250;               // How often to publish to debug topic in ms
+  The following can be changed to alter the behaviour of the code or accomodate your physical setup
+*/
 
-  // MQTT
-  byte         mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFF, 0xFF };
-  unsigned int mqttReconnectFrequency = 5000;             // How long to wait between reconnection attempts in ms
+// Sensor
+unsigned int mainLoopFrequency = 1;                     // How long to wait between main loop iterations in ms. This directly affects how often the pins are read
+unsigned int luxPublishFrequency = 60000;               // How often to publish lux in ms
+float        luxReactiveThreshold = 1.6;                // Factor that the lux value that needs to change for a reactive publish of lux values
+float        filterAlpha = mainLoopFrequency * 0.005;   // Smoothing factor for lux values. Lower is more smoothing but less responsive. Range of 0 - 1.0. Paired with 
+                                                        // mainLoopFrequency so that can be changed without affecting the desired filter behaviour
+
+// MQTT
+unsigned int mqttReconnectFrequency = 5000;             // How long to wait between reconnection attempts in ms
+
+// Debugging
+bool         debug = false;                             // Send various debug output via MQTT
+unsigned int debugPublishFrequency = 250;               // How often to publish to debug topic in ms
+
+// Pins (Ethernet blocks the following: 4, 10-13, 50-52)
+const int faradite1LuxPin    = A15;                     // Lux sensor pin
+const int faradite1MotionPin = 48;                      // Motion sensor pin
+
+/*
+  End Parameters
+*/
 
 
-  // Pins (Ethernet blocks the following: 4, 10-13, 50-52)
-  const int faradite1LuxPin    = A15;         // Lux sensor pin
-  const int faradite1MotionPin = 48;          // Motion sensor pin
+/*
+  General vars
+*/
+
+// MQTT
+EthernetClient ethClient;
+IPAddress      ip(IP1, IP2, IP3, IP4);      // IP address of the arduino
+byte           mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFF, 0xFF };
+unsigned int   mqttReconnectMillis = 0;
+PubSubClient   mqttClient(ethClient);
+const char*    mqttServer = MQTT_SERVER;    // IP address of mqtt server
+
+// General
+unsigned long currentMillis = 0;            // Updates baseline for all millisecond comparisons
+unsigned long globalLoopPreviousMillis = 0; // Compared between currentMillis for mainLoopFrequency calculation
+char          charBuffer[4];                // Stores converted ints - covers ADC range (0 - 1023)
+
+// Debug
+unsigned long debugPreviousMillis = 0;
+unsigned int  luxReads = 0;                 // How many times have we read
+
+// Lux
+unsigned long luxSendPreviousMillis = 0;    // Compared between currentMillis for luxPublishFrequency calculation
+float         luxAvgChangeFactor = 0.0;     // The factor of change between avg readings
+unsigned int  rawLuxValue = 0;              // Raw lux value from sensor
+int           filteredLuxValue = 0;         // Filtered lux value
+bool          luxSend = 0;                  // The lux value should be published        
+int           luxLastSent = 0;              // Last lux value to be published
+Ewma          adcFilter(filterAlpha);       // EWMA filtering object - smooths out noise and jitter from pin readings
+
+// Motion
+int           motionValue = 0;              // Motion value from sensor
+bool          motionStartSent = 0;          // True if motion has been detected and sent to server
+bool          motionStopSent = 1;           // True if motion has stopped and this has been sent to the server
+
+/*
+  End General Vars
+*/
 
 
-// Logic vars
-
-  // MQTT
-  unsigned int   mqttReconnectMillis = 0;
-  EthernetClient ethClient;
-  PubSubClient   mqttClient(ethClient);
-  IPAddress      ip(IP1, IP2, IP3, IP4);      // IP address of the arduino
-  const char*    mqttServer = MQTT_SERVER;    // IP address of mqtt server
-
-  // General
-  unsigned long currentMillis = 0;            // Updates baseline for all millisecond comparisons
-  unsigned long globalLoopPreviousMillis = 0; // Compared between currentMillis for mainLoopFrequency calculation
-  char          charBuffer[4];                // Stores converted ints - covers ADC range (0 - 1023)
-  
-  // Debug
-  unsigned long debugPreviousMillis = 0;
-  unsigned int  luxReads = 0;                 // How many times have we read
-
-  // Lux
-  unsigned long luxSendPreviousMillis = 0;    // Compared between currentMillis for luxPublishFrequency calculation
-  float         luxAvgChangeFactor = 0.0;     // The factor of change between avg readings
-  unsigned int  rawLuxValue = 0;              // Raw lux value from sensor
-  int           filteredLuxValue = 0;         // Filtered lux value
-  bool          luxSend = 0;                  // The lux value should be published        
-  int           luxLastSent = 0;              // Last lux value to be published
-  Ewma          adcFilter(filterAlpha);       // EWMA filtering object - smooths out noise and jitter from pin readings
-  
-  // Motion
-  int           motionValue = 0;              // Motion value from sensor
-  bool          motionStartSent = 0;          // True if motion has been detected and sent to server
-  bool          motionStopSent = 1;           // True if motion has stopped and this has been sent to the server
-
+void readLux();
+void readMotion();
+void mqttReconnect();
+void subscribeReceive(char* topic, byte* payload, unsigned int length);
+bool publishToTopic(char* topic, char* payload);
+char* ADCIntToChar(int intValue);
+float clamp(float d, float min, float max);
 
 void setup() {
   Serial.begin(9600);
