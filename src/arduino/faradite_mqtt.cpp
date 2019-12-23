@@ -18,11 +18,37 @@ float clamp(float d, float min, float max);
   Read Faradite Motion 360 sensor values and send to MQTT topic.
   
   The main goal of this code is to publish cleansed motion and lux sensor values to MQTT topics at a timely cadence.
-  It must also be reactive, in that significant sudden changes should break the typical cadence cycle and be sent immediately.
+  It is also reactive, in that significant sudden changes should break the typical cadence cycle and be sent immediately.
   For this reason the sensor is queried frequently, rather than once a second for example. The use of filters is directly related
   to the polling frequency.
   
   Currently only supports one unit.
+*/
+
+/*
+  Build Configuration 
+  
+  "Sensitive" information such as logins and passwords should be defined at build-time if 
+  building with platformio, by setting the build_flags parameter in the target build environment.
+
+  Otherwise, just change the below values to your preferred ones and run.
+
+*/
+
+#ifndef MQTT_SERVER
+#define MQTT_SERVER "192.168.0.1"
+#endif
+
+// Arduino IP Address
+#if !defined(IP1) || !defined(IP2) || !defined(IP3) || !defined(IP4)
+#define IP1 192
+#define IP2 168
+#define IP3 0
+#define IP4 20
+#endif
+
+/*
+  End Build Configuration 
 */
 
 
@@ -40,9 +66,8 @@ float clamp(float d, float min, float max);
 
   // MQTT
   byte         mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFF, 0xFF };
-  const char*  mqttServer = "192.168.40.2";               // IP address of mqtt server
   unsigned int mqttReconnectFrequency = 5000;             // How long to wait between reconnection attempts in ms
-  IPAddress ip(192, 168, 40, 10);                         // IP address of the arduino
+
 
   // Pins (Ethernet blocks the following: 4, 10-13, 50-52)
   const int faradite1LuxPin    = A15;         // Lux sensor pin
@@ -55,6 +80,8 @@ float clamp(float d, float min, float max);
   unsigned int   mqttReconnectMillis = 0;
   EthernetClient ethClient;
   PubSubClient   mqttClient(ethClient);
+  IPAddress      ip(IP1, IP2, IP3, IP4);      // IP address of the arduino
+  const char*    mqttServer = MQTT_SERVER;    // IP address of mqtt server
 
   // General
   unsigned long currentMillis = 0;            // Updates baseline for all millisecond comparisons
