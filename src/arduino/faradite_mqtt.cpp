@@ -53,7 +53,7 @@
 unsigned int  mainLoopFrequency = 1;                    // How long to wait between main loop iterations in ms. This directly affects how often the pins are read
 unsigned long luxPublishFrequency = 60000;              // How often to publish lux in ms
 float         luxReactiveThreshold = 1.6;               // Factor that the lux value that needs to change for a reactive publish of lux values
-float         filterAlpha = 0.01;                       // Smoothing factor for lux values. Lower is more smoothing but less responsive. Range of 0 - 1.0. Paired with 
+double        filterAlpha = 0.01;                       // Smoothing factor for lux values. Lower is more smoothing but less responsive. Range of 0 - 1.0. Paired with 
                                                         // mainLoopFrequency so that can be changed without affecting the desired filter behaviour
 
 // MQTT
