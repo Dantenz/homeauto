@@ -15,7 +15,6 @@
 #include <SPI.h>
 #include <PubSubClient.h>
 
-
 /*
   Build Configuration 
   
@@ -50,17 +49,17 @@
 */
 
 // Sensor
-unsigned int  mainLoopFrequency = 1;                    // How long to wait between main loop iterations in ms. This directly affects how often the pins are read
+unsigned int  mainLoopFrequency = 1;                    // How long to wait between main loop iterations in ms
+unsigned int  luxPollFrequency = 250;                   // How often to read lux in ms
 unsigned long luxPublishFrequency = 60000;              // How often to publish lux in ms
-float         luxReactiveThreshold = 1.6;               // Factor that the lux value that needs to change for a reactive publish of lux values
-double        filterAlpha = 0.01;                       // Smoothing factor for lux values. Lower is more smoothing but less responsive. Range of 0 - 1.0. Paired with 
-                                                        // mainLoopFrequency so that can be changed without affecting the desired filter behaviour
+float         luxReactiveThreshold = 0.1;               // Controls amount of change required between last sent and current lux value, before resending reactively. Range of 0 - 0.5.
+float         filterAlpha = 0.07;                       // Smoothing factor for lux values. Lower is more smoothing but less responsive. Range of 0 - 1.0.
 
 // MQTT
 unsigned int mqttReconnectFrequency = 5000;             // How long to wait between reconnection attempts in ms
 
 // Debugging
-bool         debug = true;                             // Send various debug output via MQTT
+bool         debug = false;                             // Send various debug output via MQTT
 unsigned int debugPublishFrequency = 250;               // How often to publish to debug topic in ms
 
 // Pins (Ethernet blocks the following: 4, 10-13, 50-52)
@@ -87,20 +86,23 @@ const char*    mqttServer = MQTT_SERVER;    // IP address of mqtt server
 // General
 unsigned long currentMillis = 0;            // Updates baseline for all millisecond comparisons
 unsigned long globalLoopPreviousMillis = 0; // Compared between currentMillis for mainLoopFrequency calculation
-char          charBuffer[50];               // Stores converted vals
+char          charBuffer[10];               // Stores converted vals
 
 // Debug
 unsigned long debugPreviousMillis = 0;
 unsigned int  luxReads = 0;                 // How many times have we read
 
 // Lux
-unsigned long luxSendPreviousMillis = 0;    // Compared between currentMillis for luxPublishFrequency calculation
+unsigned long luxPublishPreviousMillis = 0; // Compared between currentMillis for luxPublishFrequency calculation
+unsigned long luxPollPreviousMillis = 0;    // Compared between currentMillis for luxPollFrequency calculation
 float         luxAvgChangeFactor = 0.0;     // The factor of change between avg readings
 unsigned int  rawLuxValue = 0;              // Raw lux value from sensor
-int           filteredLuxValue = 0;         // Filtered lux value
-bool          luxSend = 0;                  // The lux value should be published        
-int           luxLastSent = 0;              // Last lux value to be published
-Ewma          adcFilter(filterAlpha);       // EWMA filtering object - smooths out noise and jitter from pin readings
+unsigned int  filteredLuxValue = 0;         // Filtered lux value       
+unsigned int  luxLastSent = 0;              // Last lux value to be published
+unsigned int  luxReactiveChangeRequired = 0;// Difference required between current and previously sent values to trigger a change
+unsigned int  luxReactiveDifference = 0;    // Difference between current and previously sent values
+bool          reactiveLuxSend = false;      // Whether or not a reactive send as been triggered
+Ewma          adcFilter(filterAlpha);       // EWMA filtering object - smooths out noise and jitter from pin readings.
 
 // Motion
 int           motionValue = 0;              // Motion value from sensor
@@ -120,7 +122,8 @@ void subscribeReceive(char* topic, byte* payload, unsigned int length);
 bool publishToTopic(char* topic, char* payload);
 bool isTopic(char* topicReceived, char* topicToMatch);
 void setDebug(bool newValue);
-void setMainLoopFrequency(unsigned int newValue);
+void setDebugPublishFrequency(unsigned int newValue);
+void setLuxPollFrequency(unsigned int newValue);
 void setLuxPublishFrequency(unsigned long newValue);
 void setLuxReactiveThreshold(float newValue);
 void setFilterAlpha(float newValue);
@@ -149,9 +152,13 @@ void setup() {
   mqttReconnectMillis = millis() - mqttReconnectFrequency;
   mqttReconnect();
 
+  // Publish a lux value immediately
+  luxPublishPreviousMillis = millis() - luxPublishFrequency;
+
   // Sanitise parameters and send initial values
   setDebug(debug);
-  setMainLoopFrequency(mainLoopFrequency);
+  setDebugPublishFrequency(debugPublishFrequency);
+  setLuxPollFrequency(luxPollFrequency);
   setLuxPublishFrequency(luxPublishFrequency);
   setLuxReactiveThreshold(luxReactiveThreshold);
   setFilterAlpha(filterAlpha);
@@ -178,39 +185,52 @@ void readLux() {
   // However, if a value varies from the last published by a certain degree (i.e. a light turning on or a curtain closing)
   // then we'll send it immediately. Theoretically we could send a message every "luxPublishFrequency", but this is highly
   // unlikely (unless you have a strobe light, in which case you can lower the adcFilter alpha) 
-  
-  rawLuxValue = analogRead(faradite1LuxPin);
-  
-  // Filter and round to int - assuming too much noise for float resolution to be useful
-  filteredLuxValue = round(adcFilter.filter(rawLuxValue));
 
-  // Calculate change factor (up and down) - Can't divide by 0, so clamp values
-  if (filteredLuxValue >= luxLastSent) luxAvgChangeFactor = clamp(filteredLuxValue, 1, 1023) / clamp(luxLastSent, 1, 1023);
-  else                            luxAvgChangeFactor = clamp(luxLastSent, 1, 1023) / clamp(filteredLuxValue, 1, 1023);
+  if (currentMillis - luxPollPreviousMillis >= luxPollFrequency) {
+    luxPollPreviousMillis = currentMillis;
 
-  // Should we send the latest average?
-  if (luxAvgChangeFactor >= luxReactiveThreshold || currentMillis - luxSendPreviousMillis >= luxPublishFrequency) {
-    // Lux has either adaptively shifted beyond the last sent value, or the timer has ticked over
-    publishToTopic("arduino/lux", intToChar(filteredLuxValue));
+    rawLuxValue = analogRead(faradite1LuxPin);
     
-    // Update these redardless of successful publish or not - it won't be long till it loops around again
-    luxLastSent = filteredLuxValue;
-    luxSendPreviousMillis = currentMillis;
-  }
+    filteredLuxValue = round(adcFilter.filter(rawLuxValue));
 
-  if (debug) {
-    luxReads++;
+    reactiveLuxSend = false;
+
+    if (filteredLuxValue >= luxLastSent) luxReactiveDifference = filteredLuxValue - luxLastSent;
+    else                                 luxReactiveDifference = luxLastSent - filteredLuxValue;
     
-    if (currentMillis - debugPreviousMillis >= debugPublishFrequency) {
-      publishToTopic("arduino/debug/lux", intToChar(filteredLuxValue));
-      publishToTopic("arduino/debug/rawlux", intToChar(rawLuxValue));
-      publishToTopic("arduino/debug/luxreads", intToChar(luxReads));
+    // Only reactive send if the value has actually changed
+    if (luxReactiveDifference >= 1) {
+      // Check if the difference is enough to trigger a reactive change
+      luxReactiveChangeRequired = floor(filteredLuxValue * luxReactiveThreshold) + 1;
 
-      if (luxReads < (debugPublishFrequency * mainLoopFrequency) * 0.9 ) Serial.println("WARNING: CPU Choke");
+      if (luxReactiveDifference >= luxReactiveChangeRequired) reactiveLuxSend = true;
+    }
 
-      luxReads = 0;
+    // Should we send the latest average?
+    if (reactiveLuxSend || currentMillis - luxPublishPreviousMillis >= luxPublishFrequency) {
+      // Lux has either adaptively shifted beyond the last sent value, or the timer has ticked over
+      publishToTopic("arduino/lux", intToChar(filteredLuxValue));
       
-      debugPreviousMillis = currentMillis;
+      // Update these redardless of successful publish or not - it won't be long till it loops around again
+      luxLastSent = filteredLuxValue;
+      luxPublishPreviousMillis = currentMillis;
+    }
+
+    if (debug) {
+      luxReads++;
+      
+      if (currentMillis - debugPreviousMillis >= debugPublishFrequency) {
+        publishToTopic("arduino/debug/lux", intToChar(filteredLuxValue));
+        publishToTopic("arduino/debug/rawlux", intToChar(rawLuxValue));
+        publishToTopic("arduino/debug/luxreads", intToChar(luxReads));
+
+        // We're not looping as fast as we should be
+        if (luxReads < (debugPublishFrequency / luxPollFrequency) * 0.75 ) Serial.println("WARNING: CPU Choke");
+
+        luxReads = 0;
+        
+        debugPreviousMillis = currentMillis;
+      }
     }
   }
 }
@@ -234,19 +254,20 @@ void readMotion() {
 
 void subscribeToTopics() {
   mqttClient.subscribe("arduino/set/debug");
-  mqttClient.subscribe("arduino/set/mainloopfrequency");
+  mqttClient.subscribe("arduino/set/debugpublishfrequency");
+  mqttClient.subscribe("arduino/set/luxpollfrequency");
   mqttClient.subscribe("arduino/set/luxpublishfrequency");
   mqttClient.subscribe("arduino/set/luxreactivethreshold");
   mqttClient.subscribe("arduino/set/filteralpha");
 
   mqttClient.subscribe("arduino/get/debug");
-  mqttClient.subscribe("arduino/get/mainloopfrequency");
+  mqttClient.subscribe("arduino/get/debugpublishfrequency");
+  mqttClient.subscribe("arduino/get/luxpollfrequency");
   mqttClient.subscribe("arduino/get/luxpublishfrequency");
   mqttClient.subscribe("arduino/get/luxreactivethreshold");
   mqttClient.subscribe("arduino/get/filteralpha");
 }
 
-// Unused at the moment
 void subscribeReceive(char* topic, byte* payload, unsigned int length) {
 
   String strPayload = byteToString(payload, length);
@@ -258,11 +279,17 @@ void subscribeReceive(char* topic, byte* payload, unsigned int length) {
   } else if(isTopic(topic, "arduino/get/debug")) {
     publishToTopic("arduino/debug", intToChar(debug));
 
-  // Main Loop Frequency get/set
-  } else if(isTopic(topic, "arduino/set/mainloopfrequency")) {
-    setMainLoopFrequency(strPayload.toInt());
-  } else if(isTopic(topic, "arduino/get/mainloopfrequency")) {
-    publishToTopic("arduino/mainloopfrequency", intToChar(mainLoopFrequency));
+  // Debug Publish Frequency get/set
+  } else if(isTopic(topic, "arduino/set/debugpublishfrequency")) {
+    setDebugPublishFrequency(strPayload.toInt());
+  } else if(isTopic(topic, "arduino/get/debugpublishfrequency")) {
+    publishToTopic("arduino/debugpublishfrequency", intToChar(debugPublishFrequency));
+
+  // Lux Poll Frequency get/set
+  } else if(isTopic(topic, "arduino/set/luxpollfrequency")) {
+    setLuxPollFrequency(strPayload.toInt());
+  } else if(isTopic(topic, "arduino/get/luxpollfrequency")) {
+    publishToTopic("arduino/luxpollfrequency", intToChar(luxPollFrequency));
 
   // Lux Publish Frequency get/set
   } else if(isTopic(topic, "arduino/set/luxpublishfrequency")) {
@@ -324,28 +351,35 @@ void setDebug(bool newValue) {
   publishToTopic("arduino/debug", intToChar(debug));
 }
 
-void setMainLoopFrequency(unsigned int newValue) {
-  mainLoopFrequency = clamp(newValue, 1, 60000);
+void setDebugPublishFrequency(unsigned int newValue) {
+  debugPublishFrequency = newValue;
 
-  publishToTopic("arduino/mainloopfrequency", intToChar(mainLoopFrequency));
+  publishToTopic("arduino/debugpublishfrequency", intToChar(debugPublishFrequency));
+}
+
+void setLuxPollFrequency(unsigned int newValue) {
+  luxPollFrequency = clamp(newValue, mainLoopFrequency, 60000);
+
+  publishToTopic("arduino/luxpollfrequency", intToChar(luxPollFrequency));
 }
 
 void setLuxPublishFrequency(unsigned long newValue) {
   // Clamp floor to mainLoopFrequency - there is no point in sending more frequently than the pins are polled
-  luxPublishFrequency = clamp(newValue, mainLoopFrequency, 604800000);  // 1 week max should be more than enough
+  luxPublishFrequency = clamp(newValue, luxPollFrequency, 604800000);  // 1 week max should be more than enough
 
   publishToTopic("arduino/luxpublishfrequency", longToChar(luxPublishFrequency));
 }
 
 void setLuxReactiveThreshold(float newValue) {
   // A floor of 1 will always fire when the value is the same as the last, so clamp it out
-  luxReactiveThreshold = clamp(newValue, 1.01, 5);
+  luxReactiveThreshold = clamp(newValue, 0, 0.5);
 
   publishToTopic("arduino/luxreactivethreshold", floatToChar(luxReactiveThreshold));
 }
 
 void setFilterAlpha(float newValue) {
   filterAlpha = clamp(newValue, 0, 1);
+  adcFilter.alpha = filterAlpha;
 
   publishToTopic("arduino/filteralpha", floatToChar(filterAlpha));
 }
